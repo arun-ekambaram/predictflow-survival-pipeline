@@ -1,0 +1,981 @@
+"""
+================================================================================
+  ENTERPRISE DATA QUALITY FRAMEWORK  v3.0
+  Source vs Target Comparison — Financial Data
+================================================================================
+
+  JUPYTER USAGE (load data once, run report as many times as needed):
+  ─────────────────────────────────────────────────────────────────────
+  # Cell 1 — Load once
+  from dq_report_v2 import load_csv, run_dq_report
+  src = load_csv("source.csv")
+  tgt = load_csv("target.csv")
+
+  # Cell 2 — Run report (reuse loaded dataframes, filter by date/keys)
+  run_dq_report(
+      src            = src,
+      tgt            = tgt,
+      key_col        = "n_acct",
+      date_col       = "report_date",
+      start_date     = "2024-01-01",
+      end_date       = "2024-12-31",
+      output_path    = "DQ_Report.xlsx",
+  )
+
+  KEY BEHAVIOURS
+  ─────────────────────────────────────────────────────────────────────
+  • Comparison is restricted to key IDs present in BOTH source & target
+  • Date filter applied before any comparison
+  • DataFrames are never mutated — safe to re-run with different params
+================================================================================
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import io, gc, logging
+from datetime import datetime
+from typing   import Optional
+
+import numpy  as np
+import pandas as pd
+from scipy    import stats as scipy_stats
+
+from openpyxl                     import Workbook
+from openpyxl.styles              import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule     import ColorScaleRule
+from openpyxl.utils               import get_column_letter
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  DATA LOADING  (call once, keep in memory)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_csv(filepath: str, chunksize: int = 500_000) -> pd.DataFrame:
+    """
+    Robust CSV loader — strips null bytes, auto-detects delimiter, chunked.
+    Call this ONCE per file and keep the result in a variable.
+    """
+    log.info(f"Loading  {filepath}")
+    with open(filepath, "rb") as fh:
+        raw = fh.read()
+    cleaned = raw.replace(b"\x00", b"").replace(b"\r\n", b"\n")
+    buf     = io.StringIO(cleaned.decode("utf-8", errors="replace"))
+
+    sample = buf.read(4096); buf.seek(0)
+    delim  = next((d for d in [",", "|", "\t", ";"] if d in sample), ",")
+
+    NULL_VALS = {"", "NULL", "null", "None", "none", "NA", "N/A", "NaN", "nan", "#N/A"}
+    chunks = []
+    for chunk in pd.read_csv(buf, sep=delim, chunksize=chunksize,
+                             low_memory=False, on_bad_lines="warn",
+                             na_values=NULL_VALS, keep_default_na=True,
+                             quotechar='"', escapechar="\\"):
+        chunks.append(chunk)
+        gc.collect()
+
+    df = pd.concat(chunks, ignore_index=True)
+    log.info(f"  → {len(df):,} rows  ×  {len(df.columns)} cols")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  TYPE DETECTION & COERCION
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DATE_HINTS = [r"\d{4}-\d{2}-\d{2}", r"\d{2}/\d{2}/\d{4}", r"\d{2}-\d{2}-\d{4}"]
+
+def _detect_types(df: pd.DataFrame) -> dict:
+    result = {}
+    for col in df.columns:
+        s = df[col].dropna().head(500)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            result[col] = "numeric"; continue
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            result[col] = "date"; continue
+        ss = s.astype(str)
+        if any(ss.str.match(p).mean() > 0.8 for p in _DATE_HINTS):
+            result[col] = "date"; continue
+        try:
+            pd.to_numeric(s, errors="raise")
+            result[col] = "numeric"
+        except Exception:
+            n_unique = df[col].nunique()
+            result[col] = "categorical" if n_unique / max(len(df[col].dropna()), 1) < 0.5 else "text"
+    return result
+
+def _coerce(df: pd.DataFrame, col_types: dict) -> pd.DataFrame:
+    df = df.copy()
+    for col, ctype in col_types.items():
+        if col not in df.columns: continue
+        if ctype == "numeric":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif ctype == "date":
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  DATE FILTERING  (non-destructive — works on a copy)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_date_filter(
+    df: pd.DataFrame,
+    date_col: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> pd.DataFrame:
+    if not date_col or date_col not in df.columns:
+        return df
+    if not start_date and not end_date:
+        return df
+    s = pd.to_datetime(df[date_col], errors="coerce")
+    mask = pd.Series(True, index=df.index)
+    if start_date:
+        mask &= s >= pd.Timestamp(start_date)
+    if end_date:
+        mask &= s <= pd.Timestamp(end_date)
+    filtered = df[mask].reset_index(drop=True)
+    log.info(f"  Date filter [{start_date} → {end_date}]: {len(df):,} → {len(filtered):,} rows")
+    return filtered
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  COMMON KEY FILTERING  (only IDs present in BOTH datasets)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _filter_common_keys(
+    src: pd.DataFrame,
+    tgt: pd.DataFrame,
+    key_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    src_keys = set(src[key_col].dropna().astype(str))
+    tgt_keys = set(tgt[key_col].dropna().astype(str))
+    common   = src_keys & tgt_keys
+
+    src_only = src_keys - tgt_keys
+    tgt_only = tgt_keys - src_keys
+
+    src_f = src[src[key_col].astype(str).isin(common)].reset_index(drop=True)
+    tgt_f = tgt[tgt[key_col].astype(str).isin(common)].reset_index(drop=True)
+
+    # sort by key for aligned comparison
+    src_f = src_f.sort_values(key_col).reset_index(drop=True)
+    tgt_f = tgt_f.sort_values(key_col).reset_index(drop=True)
+
+    key_stats = {
+        "total_src_keys"  : len(src_keys),
+        "total_tgt_keys"  : len(tgt_keys),
+        "common_keys"     : len(common),
+        "only_in_src"     : len(src_only),
+        "only_in_tgt"     : len(tgt_only),
+        "sample_src_only" : sorted(src_only)[:20],
+        "sample_tgt_only" : sorted(tgt_only)[:20],
+    }
+    log.info(f"  Common keys: {len(common):,}  |  Src-only: {len(src_only):,}  |  Tgt-only: {len(tgt_only):,}")
+    return src_f, tgt_f, key_stats
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  SCHEMA COMPARISON
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compare_schemas(src: pd.DataFrame, tgt: pd.DataFrame) -> pd.DataFrame:
+    sc = {c: str(src[c].dtype) for c in src.columns}
+    tc = {c: str(tgt[c].dtype) for c in tgt.columns}
+    rows = []
+    for col in sorted(set(sc) | set(tc)):
+        in_s, in_t = col in sc, col in tc
+        st, tt = sc.get(col, "—"), tc.get(col, "—")
+        status = (
+            "Both Present"      if in_s and in_t and st == tt else
+            "Type Mismatch"     if in_s and in_t else
+            "Missing in Source" if not in_s else
+            "Missing in Target"
+        )
+        rows.append({
+            "Column"          : col,
+            "Status"          : status,
+            "Source Dtype"    : st,
+            "Target Dtype"    : tt,
+            "Source Position" : list(src.columns).index(col)+1 if in_s else None,
+            "Target Position" : list(tgt.columns).index(col)+1 if in_t else None,
+        })
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  COLUMN PROFILING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _profile_col(series: pd.Series, ctype: str, label: str) -> dict:
+    n       = len(series)
+    nulls   = int(series.isna().sum())
+    nn      = series.dropna()
+    distinct= int(series.nunique(dropna=True))
+
+    d = {
+        f"{label} Rows"        : n,
+        f"{label} Nulls"       : nulls,
+        f"{label} Null %"      : round(nulls/n*100, 2) if n else 0,
+        f"{label} Non-Null"    : len(nn),
+        f"{label} Distinct"    : distinct,
+        f"{label} Duplicates"  : max(len(nn)-distinct, 0),
+        f"{label} Fill Rate %"  : round(len(nn)/n*100, 2) if n else 0,
+    }
+    if ctype == "numeric" and len(nn):
+        d.update({
+            f"{label} Min"    : round(float(nn.min()),    4),
+            f"{label} Max"    : round(float(nn.max()),    4),
+            f"{label} Mean"   : round(float(nn.mean()),   4),
+            f"{label} Median" : round(float(nn.median()), 4),
+            f"{label} StdDev" : round(float(nn.std()),    4),
+            f"{label} Q1"     : round(float(nn.quantile(.25)), 4),
+            f"{label} Q3"     : round(float(nn.quantile(.75)), 4),
+        })
+    elif ctype == "date" and len(nn):
+        d.update({
+            f"{label} Min Date"    : str(nn.min()),
+            f"{label} Max Date"    : str(nn.max()),
+            f"{label} Date Range"  : (nn.max()-nn.min()).days if len(nn)>1 else 0,
+        })
+    return d
+
+def _profile_all(src, tgt, ct_src, ct_tgt) -> pd.DataFrame:
+    common = [c for c in src.columns if c in tgt.columns]
+    rows = []
+    for col in common:
+        ctype = ct_src.get(col, "text")
+        row = {"Column": col, "Type": ctype}
+        row.update(_profile_col(src[col], ctype, "SRC"))
+        row.update(_profile_col(tgt[col], ct_tgt.get(col, ctype), "TGT"))
+        if ctype == "numeric":
+            sm = row.get("SRC Mean"); tm = row.get("TGT Mean")
+            if sm is not None and tm is not None and sm != 0:
+                row["Mean Δ"]   = round(tm - sm, 4)
+                row["Mean Δ %"] = round((tm-sm)/abs(sm)*100, 2)
+        row["Fill Δ %"] = round(
+            row.get("TGT Fill Rate %", 0) - row.get("SRC Fill Rate %", 0), 2
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  CELL-LEVEL COMPARISON
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _classify_mm(sv, tv) -> str:
+    if pd.isna(sv) and pd.isna(tv): return "Both Null"
+    if pd.isna(sv):  return "Null in Source"
+    if pd.isna(tv):  return "Null in Target"
+    if str(sv).strip().lower() == str(tv).strip().lower(): return "Case/Space Diff"
+    try:
+        if abs(float(sv)-float(tv)) < 1e-9: return "Float Precision"
+    except Exception: pass
+    return "Value Mismatch"
+
+def _cell_compare(src, tgt, sample_n=50):
+    common  = [c for c in src.columns if c in tgt.columns]
+    n_rows  = min(len(src), len(tgt))
+    s_cmp   = src[common].iloc[:n_rows].reset_index(drop=True)
+    t_cmp   = tgt[common].iloc[:n_rows].reset_index(drop=True)
+
+    summary, samples = [], []
+    for col in common:
+        sv = s_cmp[col].astype(str).str.strip()
+        tv = t_cmp[col].astype(str).str.strip()
+        mm = sv != tv
+        mc = int(mm.sum())
+        mp = round(mc/n_rows*100, 4) if n_rows else 0
+        summary.append({
+            "Column"         : col,
+            "Rows Compared"  : n_rows,
+            "Match Count"    : n_rows - mc,
+            "Match %"        : round(100-mp, 4),
+            "Mismatch Count" : mc,
+            "Mismatch %"     : mp,
+            "Status"         : "Clean" if mp==0 else "Minor (<5%)" if mp<5 else "High Mismatch",
+        })
+        if mc and len(samples) < sample_n * 5:
+            for i in mm[mm].index[:sample_n]:
+                samples.append({
+                    "Row Index"     : int(i),
+                    "Column"        : col,
+                    "Source Value"  : s_cmp[col].iloc[i],
+                    "Target Value"  : t_cmp[col].iloc[i],
+                    "Mismatch Type" : _classify_mm(s_cmp[col].iloc[i], t_cmp[col].iloc[i]),
+                })
+    return pd.DataFrame(summary), pd.DataFrame(samples)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  ROW-LEVEL CHECKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _row_checks(src, tgt, key_stats: Optional[dict] = None) -> dict:
+    r = {
+        "source_rows"     : len(src),
+        "target_rows"     : len(tgt),
+        "row_delta"       : len(tgt)-len(src),
+        "row_delta_pct"   : round((len(tgt)-len(src))/max(len(src),1)*100, 4),
+        "src_duplicates"  : int(src.duplicated().sum()),
+        "tgt_duplicates"  : int(tgt.duplicated().sum()),
+    }
+    r["src_dup_pct"] = round(r["src_duplicates"]/max(len(src),1)*100, 4)
+    r["tgt_dup_pct"] = round(r["tgt_duplicates"]/max(len(tgt),1)*100, 4)
+
+    n    = min(len(src), len(tgt))
+    common_cols = [c for c in src.columns if c in tgt.columns]
+    sh   = pd.util.hash_pandas_object(src[common_cols].iloc[:n], index=False)
+    th   = pd.util.hash_pandas_object(tgt[common_cols].iloc[:n], index=False)
+    matches = int((sh.values == th.values).sum())
+    r["row_hash_match"]    = matches
+    r["row_hash_mismatch"] = n - matches
+    r["row_hash_match_pct"]= round(matches/n*100, 4) if n else 0
+
+    if key_stats:
+        r.update(key_stats)
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9.  TIME-BASED ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _time_analysis(src, tgt, ct_src, ct_tgt, date_col=None) -> dict:
+    if not date_col:
+        # auto-detect
+        candidates = [c for c,t in ct_src.items() if t=="date" and c in tgt.columns]
+        if not candidates: return {}
+        for hint in ["date","dt","mth","month","period"]:
+            for c in candidates:
+                if hint in c.lower(): date_col = c; break
+            if date_col: break
+        if not date_col: date_col = candidates[0]
+
+    num_cols = [c for c,t in ct_src.items() if t=="numeric" and c in tgt.columns][:15]
+    if not num_cols: return {}
+
+    use = [date_col] + num_cols
+    s2  = src[use].copy(); t2 = tgt[use].copy()
+    s2[date_col] = pd.to_datetime(s2[date_col], errors="coerce")
+    t2[date_col] = pd.to_datetime(t2[date_col], errors="coerce")
+    s2 = s2.dropna(subset=[date_col]); t2 = t2.dropna(subset=[date_col])
+
+    result = {}
+    for freq, label, fmt in [
+        ("ME","Monthly","%Y-%m"), ("QE","Quarterly",""), ("YE","Yearly","%Y")
+    ]:
+        as_ = s2.set_index(date_col).resample(freq)[num_cols].agg(["sum","count","nunique"])
+        at_ = t2.set_index(date_col).resample(freq)[num_cols].agg(["sum","count","nunique"])
+        as_.columns = [f"SRC_{c}_{a}" for c,a in as_.columns]
+        at_.columns = [f"TGT_{c}_{a}" for c,a in at_.columns]
+        merged = as_.join(at_, how="outer").reset_index()
+        merged.rename(columns={date_col:"Period"}, inplace=True)
+        if freq == "QE":
+            merged["Period"] = merged["Period"].dt.to_period("Q").astype(str)
+        else:
+            merged["Period"] = merged["Period"].dt.strftime(fmt)
+        result[label] = merged
+
+    # 3-month rolling on first numeric col sum
+    if "Monthly" in result and num_cols:
+        m = result["Monthly"]
+        for pfx in ["SRC","TGT"]:
+            sc = f"{pfx}_{num_cols[0]}_sum"
+            if sc in m.columns:
+                m[f"{pfx}_3M_Rolling"] = m[sc].rolling(3, min_periods=1).mean().round(2)
+        result["Monthly"] = m
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10.  ADVANCED DQ — KS DRIFT + OUTLIERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _advanced_dq(src, tgt, ct_src) -> pd.DataFrame:
+    rows = []
+    for col, ctype in ct_src.items():
+        if ctype != "numeric" or col not in tgt.columns: continue
+        sv = src[col].dropna(); tv = tgt[col].dropna()
+        if len(sv)<10 or len(tv)<10: continue
+
+        def iqr_out(s):
+            q1,q3 = s.quantile(.25), s.quantile(.75)
+            iqr   = q3-q1
+            return int(((s<q1-1.5*iqr)|(s>q3+1.5*iqr)).sum())
+        def z_out(s):
+            return int((np.abs(scipy_stats.zscore(s))>3).sum())
+
+        ks, ksp = scipy_stats.ks_2samp(sv.values, tv.values)
+        rows.append({
+            "Column"              : col,
+            "KS Statistic"        : round(ks, 4),
+            "KS p-value"          : round(ksp, 4),
+            "Distribution Drift"  : "Drift Detected" if ksp<0.05 else "Stable",
+            "SRC IQR Outliers"    : iqr_out(sv),
+            "TGT IQR Outliers"    : iqr_out(tv),
+            "SRC Z-Score Outliers": z_out(sv),
+            "TGT Z-Score Outliers": z_out(tv),
+            "SRC Min"             : round(float(sv.min()),4),
+            "SRC Max"             : round(float(sv.max()),4),
+            "TGT Min"             : round(float(tv.min()),4),
+            "TGT Max"             : round(float(tv.max()),4),
+        })
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  DQ SCORECARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scorecard(profile_df, mismatch_df, row_stats, schema_df) -> pd.DataFrame:
+    completeness = profile_df["SRC Fill Rate %"].mean() if "SRC Fill Rate %" in profile_df else 100.0
+    consistency  = (schema_df["Status"]=="Both Present").sum() / max(len(schema_df),1) * 100
+    accuracy     = 100 - mismatch_df["Mismatch %"].mean() if len(mismatch_df) else 100.0
+    validity     = 100 - row_stats.get("src_dup_pct", 0)
+    overall      = round(0.35*completeness + 0.25*consistency + 0.30*accuracy + 0.10*validity, 2)
+
+    def grade(s):
+        return "A — Excellent" if s>=95 else "B — Good" if s>=85 else "C — Acceptable" if s>=70 else "D — Poor" if s>=50 else "F — Critical"
+
+    return pd.DataFrame([
+        {"Dimension":"Completeness", "Score":round(completeness,2), "Weight":"35%", "Grade":grade(completeness), "Description":"Avg fill-rate across source columns"},
+        {"Dimension":"Consistency",  "Score":round(consistency,2),  "Weight":"25%", "Grade":grade(consistency),  "Description":"Schema / dtype alignment"},
+        {"Dimension":"Accuracy",     "Score":round(accuracy,2),     "Weight":"30%", "Grade":grade(accuracy),     "Description":"Cell-level value match"},
+        {"Dimension":"Validity",     "Score":round(validity,2),     "Weight":"10%", "Grade":grade(validity),     "Description":"Duplicate-free rows"},
+        {"Dimension":"OVERALL",      "Score":overall,               "Weight":"100%","Grade":grade(overall),      "Description":"Weighted composite"},
+    ])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12.  EXCEL HELPERS  (minimal, clean, professional)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NAVY   = "1F3864"
+_BLUE   = "2E75B6"
+_TEAL   = "2A6EBB"
+_GREEN  = "375623"
+_AMBER  = "BF8F00"
+_RED    = "C00000"
+_WHITE  = "FFFFFF"
+_LGREY  = "F5F5F5"
+_MGREY  = "D9D9D9"
+_LRED   = "FCE4D6"
+_LAMBER = "FFF2CC"
+_LGREEN = "E2EFDA"
+_LBLUE  = "DEEAF1"
+
+def _F(bold=False, color=_WHITE, size=10, italic=False):
+    return Font(name="Calibri", bold=bold, color=color, size=size, italic=italic)
+
+def _P(color):
+    return PatternFill("solid", fgColor=color)
+
+def _B(style="thin"):
+    s = Side(style=style)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _A(h="left", v="center", wrap=False):
+    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+def _auto_width(ws, mn=8, mx=40):
+    for col in ws.columns:
+        ltr = get_column_letter(col[0].column)
+        w   = max((len(str(c.value or "")) for c in col), default=mn)
+        ws.column_dimensions[ltr].width = min(max(w+2, mn), mx)
+
+def _header(ws, headers, row, bg=_NAVY, fg=_WHITE):
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=row, column=ci, value=h)
+        c.font      = _F(bold=True, color=fg, size=10)
+        c.fill      = _P(bg)
+        c.alignment = _A("center", "center", wrap=True)
+        c.border    = _B()
+    ws.row_dimensions[row].height = 18
+
+def _rows(ws, df, start, zebra=True):
+    for ri, row_data in enumerate(df.itertuples(index=False), start):
+        bg = _LGREY if (zebra and (ri-start)%2==0) else _WHITE
+        for ci, val in enumerate(row_data, 1):
+            if isinstance(val, float) and np.isnan(val): val = ""
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.fill      = _P(bg)
+            c.font      = _F(color="000000")
+            c.border    = _B()
+            c.alignment = _A("right" if isinstance(val,(int,float)) else "left")
+
+def _section_title(ws, row, col, text, bg=_NAVY):
+    c = ws.cell(row=row, column=col, value=text)
+    c.font      = _F(bold=True, color=_WHITE, size=10)
+    c.fill      = _P(bg)
+    c.alignment = _A("left", "center")
+    c.border    = _B()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13.  SHEET BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sheet_summary(wb, src, tgt, row_stats, mismatch_df, scorecard_df,
+                   key_stats, run_ts, date_col, start_date, end_date):
+    ws = wb.create_sheet("Summary")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 22
+    ws.column_dimensions["E"].width = 18
+
+    # ── Banner ──────────────────────────────────────────────────────────────
+    ws.merge_cells("A1:E1")
+    bc = ws["A1"]
+    bc.value     = "DATA QUALITY REPORT  —  Source vs Target"
+    bc.font      = Font(name="Calibri", bold=True, color=_WHITE, size=14)
+    bc.fill      = _P(_NAVY)
+    bc.alignment = _A("center", "center")
+    ws.row_dimensions[1].height = 32
+
+    ws.merge_cells("A2:E2")
+    sc = ws["A2"]
+    period_str = f"  Period: {start_date or 'All'} → {end_date or 'All'}   |   " if date_col else ""
+    sc.value     = f"  {period_str}Generated: {run_ts}"
+    sc.font      = _F(italic=True, color="404040", size=9)
+    sc.fill      = _P(_LBLUE)
+    sc.alignment = _A("left", "center")
+    ws.row_dimensions[2].height = 15
+
+    # ── Row / Key counts ────────────────────────────────────────────────────
+    def _kv_section(ws, start_row, title, pairs, title_bg=_BLUE):
+        ws.merge_cells(f"A{start_row}:E{start_row}")
+        _section_title(ws, start_row, 1, f"  {title}", bg=title_bg)
+        ws.row_dimensions[start_row].height = 16
+        for i, (label, src_val, tgt_val, note) in enumerate(pairs, start_row+1):
+            bg = _LGREY if i%2==0 else _WHITE
+            for ci, val in [(1,label),(2,src_val),(3,tgt_val),(4,note)]:
+                c = ws.cell(row=i, column=ci, value=val)
+                c.fill = _P(bg); c.font = _F(color="000000")
+                c.border = _B(); c.alignment = _A("right" if ci>1 else "left")
+            ws.row_dimensions[i].height = 15
+        return start_row + 1 + len(pairs)
+
+    # Sub-headers row
+    sub_row = 3
+    for ci, h in enumerate(["Metric","Source","Target","Note"],1):
+        c = ws.cell(row=sub_row, column=ci, value=h)
+        c.font = _F(bold=True, color=_WHITE, size=9)
+        c.fill = _P(_TEAL); c.border = _B(); c.alignment = _A("center")
+    ws.row_dimensions[3].height = 15
+
+    row_pairs = [
+        ("Total Rows (original)",   f"{row_stats['source_rows']:,}",  f"{row_stats['target_rows']:,}",  "Before key filter"),
+        ("Common Key Rows",         f"{key_stats.get('common_keys','-'):,}" if key_stats else "—", f"{key_stats.get('common_keys','-'):,}" if key_stats else "—", "Used for comparison"),
+        ("Keys only in Source",     f"{key_stats.get('only_in_src',0):,}" if key_stats else "—", "—", "Excluded from comparison"),
+        ("Keys only in Target",     "—", f"{key_stats.get('only_in_tgt',0):,}" if key_stats else "—", "Excluded from comparison"),
+        ("Row Delta",               "—", f"{row_stats['row_delta']:+,}", f"{row_stats['row_delta_pct']:+.2f}%"),
+        ("Duplicate Rows",          f"{row_stats['src_duplicates']:,} ({row_stats['src_dup_pct']:.2f}%)",
+                                    f"{row_stats['tgt_duplicates']:,} ({row_stats['tgt_dup_pct']:.2f}%)", ""),
+        ("Row Hash Match",          f"{row_stats['row_hash_match']:,}", "—", f"{row_stats['row_hash_match_pct']:.2f}% match"),
+    ]
+    next_row = _kv_section(ws, 4, "ROW & KEY COUNTS", row_pairs, _BLUE)
+
+    # ── Column counts ────────────────────────────────────────────────────────
+    common_cols  = len([c for c in src.columns if c in tgt.columns])
+    src_only_cols= len([c for c in src.columns if c not in tgt.columns])
+    tgt_only_cols= len([c for c in tgt.columns if c not in src.columns])
+
+    col_pairs = [
+        ("Source Columns",          f"{len(src.columns):,}", "—", ""),
+        ("Target Columns",          "—", f"{len(tgt.columns):,}", ""),
+        ("Common Columns",          f"{common_cols:,}", f"{common_cols:,}", "Used for comparison"),
+        ("Columns only in Source",  f"{src_only_cols:,}", "—", ""),
+        ("Columns only in Target",  "—", f"{tgt_only_cols:,}", ""),
+    ]
+    next_row += 1
+    next_row = _kv_section(ws, next_row, "COLUMN COUNTS", col_pairs, _TEAL)
+
+    # ── Mismatch summary ─────────────────────────────────────────────────────
+    if len(mismatch_df):
+        total_mm   = int(mismatch_df["Mismatch Count"].sum())
+        clean_cols = int((mismatch_df["Mismatch %"]==0).sum())
+        high_mm    = int((mismatch_df["Mismatch %"]>=5).sum())
+        avg_mm_pct = round(mismatch_df["Mismatch %"].mean(), 2)
+
+        mm_pairs = [
+            ("Total Mismatched Cells", f"{total_mm:,}", "—", ""),
+            ("Columns — Fully Clean",  f"{clean_cols:,}", "—", "0% mismatch"),
+            ("Columns — High Mismatch",f"{high_mm:,}",  "—", "≥5% mismatch"),
+            ("Avg Mismatch % (all cols)",f"{avg_mm_pct}%","—", ""),
+        ]
+        next_row += 1
+        next_row = _kv_section(ws, next_row, "CELL-LEVEL MISMATCH COUNTS", mm_pairs, "8B0000")
+
+    # ── Null summary ─────────────────────────────────────────────────────────
+    if "SRC Null %" in mismatch_df.columns or "SRC Nulls" in mismatch_df.columns:
+        pass  # already in profiling sheet
+
+    # ── Scorecard ─────────────────────────────────────────────────────────────
+    next_row += 1
+    ws.merge_cells(f"A{next_row}:E{next_row}")
+    _section_title(ws, next_row, 1, "  DQ SCORECARD", bg=_NAVY)
+    ws.row_dimensions[next_row].height = 16
+    next_row += 1
+    _header(ws, list(scorecard_df.columns), next_row, bg=_TEAL)
+    next_row += 1
+
+    grade_bg = {"A":_LGREEN, "B":_LGREEN, "C":_LAMBER, "D":_LRED, "F":_LRED}
+    for ri, row_data in enumerate(scorecard_df.itertuples(index=False), next_row):
+        is_overall = "OVERALL" in str(row_data[0])
+        grade_char = str(row_data[3])[0] if len(str(row_data[3]))>0 else "A"
+        bg = _LAMBER if is_overall else grade_bg.get(grade_char, _WHITE)
+        for ci, val in enumerate(row_data, 1):
+            if isinstance(val, float) and np.isnan(val): val = ""
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.fill = _P(bg)
+            c.font = Font(name="Calibri", bold=is_overall, color="000000" if not is_overall else _NAVY, size=10)
+            c.border = _B()
+            c.alignment = _A("right" if ci==2 else "left")
+        ws.row_dimensions[ri].height = 15
+
+
+def _sheet_schema(wb, schema_df):
+    ws = wb.create_sheet("Schema Comparison")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:F1")
+    c = ws["A1"]
+    c.value = "Schema Comparison"; c.font = _F(bold=True, color=_WHITE, size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    _header(ws, list(schema_df.columns), 2, bg=_BLUE)
+    _rows(ws, schema_df, 3)
+
+    status_ci = list(schema_df.columns).index("Status") + 1
+    for ri in range(3, 3+len(schema_df)):
+        val = str(ws.cell(row=ri, column=status_ci).value or "")
+        if "Missing" in val:
+            for ci in range(1,7): ws.cell(row=ri, column=ci).fill = _P(_LRED)
+        elif "Type Mismatch" in val:
+            for ci in range(1,7): ws.cell(row=ri, column=ci).fill = _P(_LAMBER)
+        else:
+            ws.cell(row=ri, column=status_ci).fill = _P(_LGREEN)
+    _auto_width(ws)
+
+
+def _sheet_profiling(wb, profile_df):
+    ws = wb.create_sheet("Column Profiling")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:D1")
+    c = ws["A1"]
+    c.value = "Column-Level Profiling  (Source vs Target)"; c.font = _F(bold=True,color=_WHITE,size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    _header(ws, list(profile_df.columns), 2, bg=_TEAL)
+    _rows(ws, profile_df, 3)
+
+    null_ci = next((i+1 for i,h in enumerate(profile_df.columns) if h=="SRC Null %"), None)
+    if null_ci:
+        for ri in range(3, 3+len(profile_df)):
+            try:
+                v = float(ws.cell(row=ri, column=null_ci).value or 0)
+                if v>20:   ws.cell(row=ri, column=null_ci).fill = _P(_LRED)
+                elif v>5:  ws.cell(row=ri, column=null_ci).fill = _P(_LAMBER)
+            except Exception: pass
+
+    ws.freeze_panes = "C3"
+    _auto_width(ws)
+
+
+def _sheet_mismatch_summary(wb, mismatch_df):
+    ws = wb.create_sheet("Mismatch Summary")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:G1")
+    c = ws["A1"]
+    c.value = "Cell-Level Mismatch Summary  (per column)"; c.font = _F(bold=True,color=_WHITE,size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    _header(ws, list(mismatch_df.columns), 2, bg=_BLUE)
+    _rows(ws, mismatch_df, 3)
+
+    mm_ci = list(mismatch_df.columns).index("Mismatch %") + 1
+    ml    = get_column_letter(mm_ci)
+    lr    = 2 + len(mismatch_df)
+    ws.conditional_formatting.add(f"{ml}3:{ml}{lr}", ColorScaleRule(
+        start_type="num", start_value=0,   start_color="E2EFDA",
+        mid_type="num",   mid_value=5,     mid_color="FFF2CC",
+        end_type="num",   end_value=100,   end_color="FCE4D6",
+    ))
+    ws.freeze_panes = "B3"
+    _auto_width(ws)
+
+
+def _sheet_mismatch_samples(wb, samples_df):
+    ws = wb.create_sheet("Mismatch Samples")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:E1")
+    c = ws["A1"]
+    c.value = "Mismatch Samples  (row-level examples)"; c.font = _F(bold=True,color=_WHITE,size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    if not len(samples_df):
+        ws.cell(row=3,column=1,value="No mismatches found — datasets are identical.").font = _F(bold=True,color="375623",size=11)
+        return
+
+    _header(ws, list(samples_df.columns), 2, bg=_BLUE)
+    _rows(ws, samples_df, 3)
+
+    mt_ci = list(samples_df.columns).index("Mismatch Type") + 1
+    for ri in range(3, 3+len(samples_df)):
+        v = str(ws.cell(row=ri, column=mt_ci).value or "")
+        if "Value Mismatch" in v:
+            ws.cell(row=ri, column=3).fill = _P(_LRED)
+            ws.cell(row=ri, column=4).fill = _P(_LRED)
+        elif "Null" in v:
+            ws.cell(row=ri, column=3).fill = _P(_LAMBER)
+            ws.cell(row=ri, column=4).fill = _P(_LAMBER)
+    _auto_width(ws)
+
+
+def _sheet_time(wb, time_results):
+    ws = wb.create_sheet("Time Analysis")
+    ws.sheet_view.showGridLines = False
+    if not time_results:
+        ws.cell(row=1,column=1,value="No date column detected — time analysis not available.")
+        return
+
+    cur = 1
+    for label, df in time_results.items():
+        if df is None or not len(df): continue
+        ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=min(len(df.columns),15))
+        _section_title(ws, cur, 1, f"  {label} Aggregation", bg=_NAVY)
+        ws.row_dimensions[cur].height = 18
+        cur += 1
+
+        cols = [c for c in df.columns if not df[c].isna().all()][:15]
+        disp = df[cols].copy()
+        if "Period" in disp.columns:
+            disp["Period"] = disp["Period"].astype(str)
+
+        _header(ws, list(disp.columns), cur, bg=_BLUE)
+        cur += 1
+        _rows(ws, disp, cur)
+        cur += len(disp) + 3
+
+    _auto_width(ws)
+
+
+def _sheet_row_checks(wb, row_stats, key_stats):
+    ws = wb.create_sheet("Row & Duplicate Checks")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:D1")
+    c = ws["A1"]
+    c.value = "Row-Level & Duplicate Analysis"; c.font = _F(bold=True,color=_WHITE,size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    data = [
+        ("Metric","Source","Target","Note"),
+        ("Total Rows",f"{row_stats['source_rows']:,}",f"{row_stats['target_rows']:,}",f"Delta: {row_stats['row_delta']:+,}"),
+        ("Duplicate Rows",f"{row_stats['src_duplicates']:,}",f"{row_stats['tgt_duplicates']:,}",
+         f"SRC {row_stats['src_dup_pct']:.2f}% | TGT {row_stats['tgt_dup_pct']:.2f}%"),
+        ("Row Hash Match",f"{row_stats['row_hash_match']:,}",f"{row_stats['row_hash_mismatch']:,} mismatches",
+         f"{row_stats['row_hash_match_pct']:.2f}% match"),
+    ]
+    if key_stats:
+        data += [
+            ("Common Keys",    f"{key_stats.get('common_keys',0):,}", f"{key_stats.get('common_keys',0):,}", "Used for comparison"),
+            ("Keys only in SRC",f"{key_stats.get('only_in_src',0):,}", "—", "Excluded"),
+            ("Keys only in TGT","—", f"{key_stats.get('only_in_tgt',0):,}", "Excluded"),
+        ]
+
+    for ri, row in enumerate(data, 2):
+        bg = _NAVY if ri==2 else (_LGREY if ri%2==0 else _WHITE)
+        fg = _WHITE if ri==2 else "000000"
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.font = Font(name="Calibri", bold=(ri==2), color=fg, size=10)
+            c.fill = _P(bg); c.border = _B()
+            c.alignment = _A("center" if ci>1 else "left", "center")
+        ws.row_dimensions[ri].height = 15
+
+    # Sample missing keys
+    for lbl, key in [("Keys in Source but NOT in Target:", "sample_src_only"),
+                     ("Keys in Target but NOT in Source:", "sample_tgt_only")]:
+        vals = key_stats.get(key, []) if key_stats else []
+        if vals:
+            r = ws.max_row + 2
+            ws.cell(row=r,column=1,value=lbl).font = Font(name="Calibri",bold=True,color="000000",size=10)
+            for i, k in enumerate(vals, r+1):
+                ws.cell(row=i,column=1,value=str(k)).font = _F(color="000000")
+
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 30
+
+
+def _sheet_advanced(wb, adv_df):
+    ws = wb.create_sheet("Advanced DQ")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:M1")
+    c = ws["A1"]
+    c.value = "Advanced DQ — Distribution Drift & Outlier Detection"; c.font = _F(bold=True,color=_WHITE,size=11)
+    c.fill = _P(_NAVY); c.alignment = _A("left","center")
+    ws.row_dimensions[1].height = 22
+
+    if not len(adv_df):
+        ws.cell(row=3,column=1,value="No numeric columns available for advanced checks."); return
+
+    _header(ws, list(adv_df.columns), 2, bg=_TEAL)
+    _rows(ws, adv_df, 3)
+
+    drift_ci = list(adv_df.columns).index("Distribution Drift") + 1
+    for ri in range(3, 3+len(adv_df)):
+        if "Drift" in str(ws.cell(row=ri, column=drift_ci).value or ""):
+            for ci in range(1, len(adv_df.columns)+1):
+                ws.cell(row=ri,column=ci).fill = _P(_LAMBER)
+    _auto_width(ws)
+
+
+def _sheet_scorecard(wb, scorecard_df):
+    ws = wb.create_sheet("DQ Scorecard")
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:E1")
+    c = ws["A1"]
+    c.value = "DQ Scorecard"; c.font = Font(name="Calibri",bold=True,color=_WHITE,size=14)
+    c.fill = _P(_NAVY); c.alignment = _A("center","center")
+    ws.row_dimensions[1].height = 32
+
+    _header(ws, list(scorecard_df.columns), 3, bg=_BLUE)
+    grade_bg = {"A":_LGREEN,"B":_LGREEN,"C":_LAMBER,"D":_LRED,"F":_LRED}
+    for ri, row_data in enumerate(scorecard_df.itertuples(index=False), 4):
+        is_overall = "OVERALL" in str(row_data[0])
+        grade_char = str(row_data[3])[0]
+        bg = _LAMBER if is_overall else grade_bg.get(grade_char, _WHITE)
+        for ci, val in enumerate(row_data, 1):
+            if isinstance(val, float) and np.isnan(val): val = ""
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.fill = _P(bg)
+            c.font = Font(name="Calibri", bold=is_overall, color="000000", size=10)
+            c.border = _B()
+            c.alignment = _A("right" if ci==2 else "left","center")
+        ws.row_dimensions[ri].height = 18
+
+    _auto_width(ws)
+    ws.column_dimensions["E"].width = 40
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 14.  MAIN ENTRY POINT  —  call with pre-loaded DataFrames
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_dq_report(
+    src              : pd.DataFrame,
+    tgt              : pd.DataFrame,
+    key_col          : Optional[str] = None,
+    date_col         : Optional[str] = None,
+    start_date       : Optional[str] = None,   # "YYYY-MM-DD"
+    end_date         : Optional[str] = None,   # "YYYY-MM-DD"
+    output_path      : str           = "DQ_Report.xlsx",
+    sample_mismatches: int           = 50,
+) -> str:
+    """
+    Generate a full DQ Excel report from pre-loaded DataFrames.
+
+    Parameters
+    ----------
+    src               : Source DataFrame (load once via load_csv())
+    tgt               : Target DataFrame (load once via load_csv())
+    key_col           : Primary key column for key-based filtering & comparison
+    date_col          : Date column name for time filtering & time analysis
+    start_date        : Filter start date  "YYYY-MM-DD"  (inclusive)
+    end_date          : Filter end date    "YYYY-MM-DD"  (inclusive)
+    output_path       : Output file name
+    sample_mismatches : Max mismatch sample rows per column
+
+    Returns
+    -------
+    str  : path to generated Excel file
+    """
+    run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log.info("=" * 60)
+    log.info("  DQ FRAMEWORK — Starting Run")
+    log.info(f"  SRC: {len(src):,} rows  |  TGT: {len(tgt):,} rows")
+    if date_col:
+        log.info(f"  Date col: {date_col}  |  Range: {start_date or 'All'} → {end_date or 'All'}")
+    log.info("=" * 60)
+
+    # ── Step 1: Date filter (non-destructive, works on copies) ──────────────
+    log.info("[1/9] Applying date filter …")
+    s = _apply_date_filter(src, date_col, start_date, end_date)
+    t = _apply_date_filter(tgt, date_col, start_date, end_date)
+
+    # ── Step 2: Detect types & coerce ───────────────────────────────────────
+    log.info("[2/9] Detecting column types …")
+    ct_src = _detect_types(s)
+    ct_tgt = _detect_types(t)
+    s = _coerce(s, ct_src)
+    t = _coerce(t, ct_tgt)
+
+    # ── Step 3: Common key filtering ────────────────────────────────────────
+    key_stats = None
+    if key_col and key_col in s.columns and key_col in t.columns:
+        log.info(f"[3/9] Filtering to common keys on '{key_col}' …")
+        s, t, key_stats = _filter_common_keys(s, t, key_col)
+    else:
+        log.info("[3/9] No key column — using full row comparison …")
+
+    # ── Step 4: Schema ───────────────────────────────────────────────────────
+    log.info("[4/9] Schema comparison …")
+    schema_df = _compare_schemas(s, t)
+
+    # ── Step 5: Column profiling ─────────────────────────────────────────────
+    log.info("[5/9] Column profiling …")
+    profile_df = _profile_all(s, t, ct_src, ct_tgt)
+
+    # ── Step 6: Cell-level comparison ────────────────────────────────────────
+    log.info("[6/9] Cell-level comparison …")
+    mismatch_df, samples_df = _cell_compare(s, t, sample_n=sample_mismatches)
+
+    # ── Step 7: Row checks ───────────────────────────────────────────────────
+    log.info("[7/9] Row-level checks …")
+    row_stats = _row_checks(s, t, key_stats)
+
+    # ── Step 8: Time analysis ─────────────────────────────────────────────────
+    log.info("[8/9] Time-based analysis …")
+    time_results = _time_analysis(s, t, ct_src, ct_tgt, date_col=date_col)
+
+    # ── Step 9: Advanced DQ ──────────────────────────────────────────────────
+    log.info("[9/9] Advanced DQ (drift + outliers) …")
+    adv_df = _advanced_dq(s, t, ct_src)
+
+    # ── Scorecard ─────────────────────────────────────────────────────────────
+    scorecard_df = _scorecard(profile_df, mismatch_df, row_stats, schema_df)
+
+    # ── Build Excel ───────────────────────────────────────────────────────────
+    log.info("Building Excel report …")
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    _sheet_summary        (wb, s, t, row_stats, mismatch_df, scorecard_df,
+                           key_stats, run_ts, date_col, start_date, end_date)
+    _sheet_schema         (wb, schema_df)
+    _sheet_profiling      (wb, profile_df)
+    _sheet_mismatch_summary(wb, mismatch_df)
+    _sheet_mismatch_samples(wb, samples_df)
+    _sheet_time           (wb, time_results)
+    _sheet_row_checks     (wb, row_stats, key_stats)
+    _sheet_advanced       (wb, adv_df)
+    _sheet_scorecard      (wb, scorecard_df)
+
+    wb.save(output_path)
+    log.info(f"Report saved  →  {output_path}")
+    log.info("=" * 60)
+    return output_path
