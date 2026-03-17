@@ -1,90 +1,75 @@
 import pandas as pd
 
 # ==============================
-# Step 1 — Setup
-# ==============================
-date_col = "date_of_approval_void_decline"
-
-# Ensure datetime
-monthly_filtered[date_col] = pd.to_datetime(monthly_filtered[date_col], errors='coerce')
-quarterly_filtered[date_col] = pd.to_datetime(quarterly_filtered[date_col], errors='coerce')
-
-# Create month column
-monthly_filtered["month"] = monthly_filtered[date_col].dt.strftime("%Y-%m")
-quarterly_filtered["month"] = quarterly_filtered[date_col].dt.strftime("%Y-%m")
-
-# ==============================
-# OPTION A — Record Count Trend
+# BASIC COUNTS
 # ==============================
 
-# Step 2 — Count per month
-monthly_count = monthly_filtered.groupby("month").size().reset_index(name="monthly_count")
-quarterly_count = quarterly_filtered.groupby("month").size().reset_index(name="quarterly_count")
+total_monthly = len(monthly_filtered)
+total_quarterly = len(quarterly_filtered)
 
-trend_df = monthly_count.merge(
-    quarterly_count, on="month", how="outer"
-).sort_values("month")
+monthly_unique = monthly_filtered["scorecard_id"].nunique()
+quarterly_unique = quarterly_filtered["scorecard_id"].nunique()
 
-# Step 3 — Month-over-month difference
-trend_df["monthly_mom_diff"] = trend_df["monthly_count"].diff()
-trend_df["quarterly_mom_diff"] = trend_df["quarterly_count"].diff()
+monthly_ids = set(monthly_filtered["scorecard_id"])
+quarterly_ids = set(quarterly_filtered["scorecard_id"])
 
-# Step 4 — 3-month rolling average
-trend_df["monthly_3m_avg"] = trend_df["monthly_count"].rolling(3).mean()
-trend_df["quarterly_3m_avg"] = trend_df["quarterly_count"].rolling(3).mean()
+common_ids = monthly_ids & quarterly_ids
+only_in_monthly = monthly_ids - quarterly_ids
+only_in_quarterly = quarterly_ids - monthly_ids
 
-# Step 5 — Compare trends
-trend_df["mom_diff_gap"] = (
-    trend_df["monthly_mom_diff"] - trend_df["quarterly_mom_diff"]
+monthly_duplicates = monthly_filtered.duplicated(subset=["scorecard_id"]).sum()
+quarterly_duplicates = quarterly_filtered.duplicated(subset=["scorecard_id"]).sum()
+
+# ==============================
+# MONTH-WISE COUNT
+# ==============================
+
+monthly_filtered["month"] = monthly_filtered["date_of_approval_void_decline"].dt.strftime("%Y-%m")
+quarterly_filtered["month"] = quarterly_filtered["date_of_approval_void_decline"].dt.strftime("%Y-%m")
+
+monthly_by_month = monthly_filtered.groupby("month").size().reset_index(name="monthly_count")
+quarterly_by_month = quarterly_filtered.groupby("month").size().reset_index(name="quarterly_count")
+
+month_comparison = monthly_by_month.merge(
+    quarterly_by_month, on="month", how="outer"
 )
 
-trend_df["avg_3m_gap"] = (
-    trend_df["monthly_3m_avg"] - trend_df["quarterly_3m_avg"]
+month_comparison["difference"] = (
+    month_comparison["monthly_count"] - month_comparison["quarterly_count"]
 )
 
 # ==============================
-# OPTION B — Fill Rate Trend
+# SUMMARY TABLE
 # ==============================
 
-def fill_rate_by_month(df):
-    return df.groupby("month").apply(lambda x: x.notna().mean() * 100)
-
-monthly_fill_trend = fill_rate_by_month(monthly_filtered)
-quarterly_fill_trend = fill_rate_by_month(quarterly_filtered)
-
-# ==============================
-# Column-level comparison
-# ==============================
-
-col = "your_column_name"  # change this
-
-compare_trend = pd.DataFrame({
-    "monthly": monthly_fill_trend[col],
-    "quarterly": quarterly_fill_trend[col]
+summary = pd.DataFrame({
+    "Metric": [
+        "Total Rows (Monthly)",
+        "Total Rows (Quarterly)",
+        "Distinct Scorecard IDs (Monthly)",
+        "Distinct Scorecard IDs (Quarterly)",
+        "Common Scorecard IDs",
+        "Only in Monthly",
+        "Only in Quarterly",
+        "Duplicate Rows (Monthly)",
+        "Duplicate Rows (Quarterly)"
+    ],
+    "Value": [
+        total_monthly,
+        total_quarterly,
+        monthly_unique,
+        quarterly_unique,
+        len(common_ids),
+        len(only_in_monthly),
+        len(only_in_quarterly),
+        monthly_duplicates,
+        quarterly_duplicates
+    ]
 })
 
-# MoM difference
-compare_trend["mom_diff_monthly"] = compare_trend["monthly"].diff()
-compare_trend["mom_diff_quarterly"] = compare_trend["quarterly"].diff()
-
-# 3-month average
-compare_trend["3m_avg_monthly"] = compare_trend["monthly"].rolling(3).mean()
-compare_trend["3m_avg_quarterly"] = compare_trend["quarterly"].rolling(3).mean()
-
 # ==============================
-# Export to CSV
+# EXPORT CSV
 # ==============================
 
-trend_df.to_csv("record_count_trend.csv", index=False)
-compare_trend.to_csv(f"{col}_fill_rate_trend.csv")
-
-# Optional: full fill trend
-monthly_fill_trend.to_csv("monthly_fill_trend.csv")
-quarterly_fill_trend.to_csv("quarterly_fill_trend.csv")
-
-# ==============================
-# Outputs
-# ==============================
-
-trend_df
-compare_trend
+summary.to_csv("01_summary_counts.csv", index=False)
+month_comparison.to_csv("02_monthly_counts.csv", index=False)
