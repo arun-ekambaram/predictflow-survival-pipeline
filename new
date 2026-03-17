@@ -1,0 +1,65 @@
+def run_dq_report(
+    source_path: str,
+    target_path: str,
+    output_path: str = "DQ_Report.xlsx",
+    key_col: Optional[str] = None,
+    sample_mismatches: int = 50,
+    chunksize: int = 500_000,
+    date_col: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+
+    # ✅ NEW
+    filter_common_keys: bool = False,
+):
+
+
+    # ── DATE FILTER (NEW) ─────────────────────────────────────────────
+    if date_col and date_col in src.columns and date_col in tgt.columns:
+        log.info(f"Filtering data for period: {start_date} → {end_date} on column: {date_col}")
+
+        src[date_col] = pd.to_datetime(src[date_col], errors="coerce")
+        tgt[date_col] = pd.to_datetime(tgt[date_col], errors="coerce")
+
+        if start_date:
+            start_date = pd.to_datetime(start_date)
+            src = src[src[date_col] >= start_date]
+            tgt = tgt[tgt[date_col] >= start_date]
+
+        if end_date:
+            end_date = pd.to_datetime(end_date)
+            src = src[src[date_col] <= end_date]
+            tgt = tgt[tgt[date_col] <= end_date]
+
+        log.info(f"After filter → Source: {len(src):,} rows | Target: {len(tgt):,} rows")
+
+
+
+# ── COMMON KEY FILTER (MULTI-KEY SUPPORT) ─────────────────────────
+if filter_common_keys and key_cols and all(k in src.columns for k in key_cols) and all(k in tgt.columns for k in key_cols):
+
+    log.info(f"Filtering only common keys based on: {key_cols}")
+
+    # create composite key
+    src_keys = set(
+        src[key_cols].astype(str).agg("||".join, axis=1)
+    )
+    tgt_keys = set(
+        tgt[key_cols].astype(str).agg("||".join, axis=1)
+    )
+
+    common_keys = src_keys & tgt_keys
+
+    src["_merge_key"] = src[key_cols].astype(str).agg("||".join, axis=1)
+    tgt["_merge_key"] = tgt[key_cols].astype(str).agg("||".join, axis=1)
+
+    src = src[src["_merge_key"].isin(common_keys)]
+    tgt = tgt[tgt["_merge_key"].isin(common_keys)]
+
+    # cleanup
+    src.drop(columns=["_merge_key"], inplace=True)
+    tgt.drop(columns=["_merge_key"], inplace=True)
+
+    log.info(f"After common key filter → Source: {len(src):,} | Target: {len(tgt):,}")
+
+
